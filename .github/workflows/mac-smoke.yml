@@ -1,0 +1,86 @@
+name: Mac smoke (Apple Silicon)
+run-name: 'Mac smoke ${{ inputs.ref }} [${{ inputs.correlation }}]'
+
+# Smoke-test de arranque en Apple Silicon (M1, runner arm64). Guardia de
+# regresión contra el "frame negro" que colgó a la Mac del compañero.
+#
+# Corre AQUÍ (repo público, runner gratis) pero prueba el código del repo
+# privado: lo dispara .github/workflows/mac-smoke.yml del repo privado, que se
+# queda esperando el resultado desde un runner Ubuntu (1x) en vez de quemar
+# macOS (10x). `correlation` es el id único que el repo privado usa para
+# encontrar este run — va en el run-name de arriba.
+#
+# ⚠️  REPO PÚBLICO: logs visibles. No añadir triggers de pull_request con
+# secrets aquí. El screenshot del smoke se sube como artifact y es público —
+# es la ventana de la app en blanco/arranque, sin datos de usuario.
+#
+# CAVEAT: los runners macOS de GitHub corren en VM SIN GPU dedicada (render por
+# software). Este job atrapa crashes de carga/JS del renderer y el frame-negro
+# por fallo de renderer, pero NO reproduce de forma fiable el wedge real de
+# Metal/WindowServer del hardware físico. Por eso el test corre con
+# HUGEDESK_DISABLE_GPU=1 (estabiliza) y sigue siendo necesaria la evidencia real
+# del hardware del compañero (.panic / log show).
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Rama/SHA del repo privado a probar'
+        required: true
+        type: string
+      correlation:
+        description: 'Id único para correlacionar el run (lo pone el repo privado)'
+        required: false
+        type: string
+        default: manual
+
+jobs:
+  smoke:
+    name: Boot smoke (macos-15 arm64)
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - name: Checkout source (repo privado)
+        uses: actions/checkout@v4
+        with:
+          repository: sebaszap123-dev/hugedesk
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          persist-credentials: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build renderer/main (electron-vite)
+        run: pnpm run build
+
+      # Playwright ad-hoc con pnpm (npm no soporta el dep link: del repo). El
+      # cambio al lockfile es efímero (solo en el checkout del runner). pnpm no
+      # ejecuta el postinstall de playwright → no descarga navegadores, y no
+      # hacen falta: _electron usa el binario de electron del propio proyecto.
+      - name: Install Playwright
+        run: pnpm add -D playwright@1
+
+      - name: Boot smoke test (frame negro / errores de renderer)
+        run: node test/mac-smoke.mjs
+
+      - name: Upload screenshot + log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mac-smoke-artifacts
+          path: |
+            smoke-screenshot.png
+            smoke-main.log
+          if-no-files-found: ignore

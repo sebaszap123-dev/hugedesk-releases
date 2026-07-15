@@ -1,0 +1,294 @@
+name: Build and Release Desktop
+
+# Construye los instaladores de HugeDesk (Fedora rpm + AppImage, macOS dmg/zip
+# firmado y notarizado, Windows nsis) y los publica como Release (draft) de ESTE
+# repo, que es el punto de distribución + feed de auto-update de la app.
+#
+# El CÓDIGO vive en el repo privado sebaszap123-dev/hugedesk y se hace checkout
+# aquí con SOURCE_REPO_TOKEN (PAT fine-grained, solo Contents:Read de ese repo).
+# El build corre aquí porque este repo es donde se publica: los runners estándar
+# de repos públicos no consumen minutos, y macOS cuesta 10x en repo privado.
+#
+# ⚠️  ESTE REPO ES PÚBLICO. Los logs de los jobs son visibles para cualquiera:
+#   - NO añadir triggers `pull_request` / `pull_request_target` con secrets a
+#     este workflow ni a ningún otro de este repo. Es la única vía por la que un
+#     fork podría exfiltrar CSC_LINK / APPLE_API_KEY / SOURCE_REPO_TOKEN.
+#   - NO activar ACTIONS_STEP_DEBUG ni `set -x`: filtraría rutas y fuente.
+#   - NO subir como artifact nada fuera de dist/ (el checkout tiene el código).
+# El código fuente no se filtra en los binarios: sourcemap:false en los 3 targets
+# de electron.vite.config.ts.
+#
+# La voz (whisper.cpp / modelos TTS sherpa-onnx) NO se empaqueta: la app la
+# descarga on-demand en runtime a userData. Aquí solo se reconstruyen las deps
+# nativas node-pty (electron-rebuild vía postinstall) y sherpa-onnx-node.
+#
+# macOS: la firma la hace rcodesign (apple-codesign), NO electron-osx-sign, que
+# colgaba ~30min en el runner (firmaba cada binario anidado contra la TSA de
+# Apple en serie). rcodesign firma el .app entero en ~10s. Ver build/afterPack.cjs.
+
+on:
+  # Lo dispara el repo privado al pushear un tag vX.Y.Z (.github/workflows/
+  # dispatch-release.yml allí). client_payload.tag = tag a construir.
+  repository_dispatch:
+    types: [build-release]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag del repo privado a construir (p. ej. v0.1.5)'
+        required: true
+        type: string
+      platform:
+        description: 'Qué construir'
+        type: choice
+        default: all
+        options:
+          - all       # linux (rpm+AppImage) + macOS + Windows
+          - linux     # rpm + AppImage
+          - fedora    # solo .rpm
+          - appimage  # solo AppImage
+          - macos     # dmg + zip (firmado/notarizado)
+          - windows   # nsis
+
+permissions:
+  contents: write # crear/actualizar el Release de este mismo repo
+
+jobs:
+  # Resuelve qué construir y de qué tag. linux/win van por matrix; macOS es un
+  # job aparte (deps nativas macOS + firma rcodesign), gateado por output `mac`.
+  setup:
+    name: Resolve targets
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.pick.outputs.matrix }}
+      mac: ${{ steps.pick.outputs.mac }}
+      tag: ${{ steps.pick.outputs.tag }}
+    steps:
+      - name: Pick platforms and tag
+        id: pick
+        env:
+          PLATFORM: ${{ github.event.inputs.platform || github.event.client_payload.platform || 'all' }}
+          TAG: ${{ github.event.inputs.tag || github.event.client_payload.tag }}
+        run: |
+          if [ -z "$TAG" ]; then echo "❌ falta el tag a construir" && exit 1; fi
+          # El tag viaja por payload externo → validar antes de meterlo en un
+          # checkout. Solo vX.Y.Z(-sufijo). Sin esto, un payload hostil podría
+          # inyectar un ref arbitrario.
+          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            echo "❌ tag inválido: $TAG" && exit 1
+          fi
+          LINUX='{"os":"ubuntu-latest","name":"linux","builder_flag":"--linux"}'
+          FEDORA='{"os":"ubuntu-latest","name":"fedora","builder_flag":"--linux rpm"}'
+          APPIMAGE='{"os":"ubuntu-latest","name":"appimage","builder_flag":"--linux AppImage"}'
+          # windows-2022 (NO windows-latest): latest migró a Server 2025 y el
+          # node-gyp@9.4.1 que electron-builder usa para recompilar node-pty no
+          # detecta ahí Visual Studio ("Could not find any Visual Studio installation").
+          WIN='{"os":"windows-2022","name":"windows","builder_flag":"--win"}'
+          MAC=false
+          case "$PLATFORM" in
+            all)      ENTRIES="$LINUX,$WIN"; MAC=true ;;
+            linux)    ENTRIES="$LINUX" ;;
+            fedora)   ENTRIES="$FEDORA" ;;
+            appimage) ENTRIES="$APPIMAGE" ;;
+            macos)    ENTRIES="" ; MAC=true ;;
+            windows)  ENTRIES="$WIN" ;;
+            *) echo "❌ platform desconocido: $PLATFORM" && exit 1 ;;
+          esac
+          echo "matrix={\"include\":[$ENTRIES]}" >> "$GITHUB_OUTPUT"
+          echo "mac=$MAC" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "→ construyendo: $PLATFORM @ $TAG (mac=$MAC)"
+
+  # Linux (rpm/AppImage) + Windows (nsis). electron-builder publica directo.
+  build:
+    name: Build (${{ matrix.name }})
+    needs: setup
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
+    steps:
+      - name: Checkout source (repo privado)
+        uses: actions/checkout@v4
+        with:
+          repository: sebaszap123-dev/hugedesk
+          ref: ${{ needs.setup.outputs.tag }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          # No dejar el PAT en .git/config: los pasos de build no hacen git.
+          persist-credentials: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      # fpm necesita rpmbuild para generar el .rpm de Fedora en Ubuntu.
+      - name: Install rpm tooling (Linux)
+        if: matrix.name == 'linux' || matrix.name == 'fedora'
+        run: sudo apt-get update && sudo apt-get install -y rpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build renderer/main (electron-vite)
+        # HUGEDESK_LICENSE_PUBKEY / HUGEDESK_ACTIVATION_URL se inyectan en build-time
+        # (electron.vite.config.ts → define). Vacías → fallback dev.
+        env:
+          HUGEDESK_LICENSE_PUBKEY: ${{ secrets.HUGEDESK_LICENSE_PUBKEY }}
+          HUGEDESK_ACTIVATION_URL: ${{ secrets.HUGEDESK_ACTIVATION_URL }}
+        run: pnpm run build
+
+      - name: Package and publish
+        env:
+          # El release es de ESTE repo → GITHUB_TOKEN basta (antes hacía falta
+          # un PAT cross-repo porque el CI vivía en el repo privado).
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: pnpm exec electron-builder ${{ matrix.builder_flag }} --publish always
+
+  # macOS: build nativo + firma rcodesign (afterPack firma el .app; el .dmg se
+  # firma aparte) + publish de dos fases vía gh (electron-builder --publish never
+  # para no subir el dmg antes de firmarlo).
+  build_mac:
+    name: Build (macOS)
+    needs: setup
+    if: needs.setup.outputs.mac == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 30 # rcodesign firma en ~10s; el timeout es red de seguridad
+    steps:
+      - name: Checkout source (repo privado)
+        uses: actions/checkout@v4
+        with:
+          repository: sebaszap123-dev/hugedesk
+          ref: ${{ needs.setup.outputs.tag }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          persist-credentials: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      # Fail-fast: detectar secrets de firma vacíos antes de gastar minutos.
+      - name: Check signing secrets
+        env:
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          MISSING=()
+          [ -z "$CSC_LINK" ] && MISSING+=("CSC_LINK")
+          [ -z "$CSC_KEY_PASSWORD" ] && MISSING+=("CSC_KEY_PASSWORD")
+          [ -z "$APPLE_API_KEY" ] && MISSING+=("APPLE_API_KEY")
+          [ -z "$APPLE_API_KEY_ID" ] && MISSING+=("APPLE_API_KEY_ID")
+          [ -z "$APPLE_API_ISSUER" ] && MISSING+=("APPLE_API_ISSUER")
+          if [ ${#MISSING[@]} -gt 0 ]; then
+            echo "❌ Secrets de firma/notarización faltantes:"; printf '   - %s\n' "${MISSING[@]}"; exit 1
+          fi
+          echo "✓ Secrets de firma presentes"
+
+      # rcodesign (apple-codesign) pineado. Cacheado para no recompilar cada run.
+      - name: Cache rcodesign
+        id: cache-rcodesign
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/rcodesign
+          key: rcodesign-0.29.0-${{ runner.os }}
+      - name: Install rcodesign
+        if: steps.cache-rcodesign.outputs.cache-hit != 'true'
+        run: cargo install apple-codesign --version 0.29.0 --locked
+
+      # Materializa la .p8 y la codifica al JSON que rcodesign notary-submit espera.
+      # OJO: la env ha de llamarse ASC_API_KEY_PATH, NO con prefijo RCODESIGN_
+      # (rcodesign mergea env RCODESIGN_* a su config → perfil 'api' inválido).
+      - name: Prepare Apple API key (rcodesign)
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          mkdir -p "$HOME/private_keys"
+          printf "%s" "$APPLE_API_KEY" | openssl base64 -d -A > "$HOME/private_keys/AuthKey.p8"
+          rcodesign encode-app-store-connect-api-key \
+            -o "$HOME/private_keys/asc-api-key.json" \
+            "$APPLE_API_ISSUER" "$APPLE_API_KEY_ID" "$HOME/private_keys/AuthKey.p8"
+          echo "ASC_API_KEY_PATH=$HOME/private_keys/asc-api-key.json" >> "$GITHUB_ENV"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build renderer/main (electron-vite)
+        env:
+          HUGEDESK_LICENSE_PUBKEY: ${{ secrets.HUGEDESK_LICENSE_PUBKEY }}
+          HUGEDESK_ACTIVATION_URL: ${{ secrets.HUGEDESK_ACTIVATION_URL }}
+        run: pnpm run build
+
+      # electron-builder arma .app + dmg + zip; NO firma (auto-discovery off,
+      # notarize:false en package.json). El hook build/afterPack.cjs firma/
+      # notariza/staplea el .app con rcodesign ANTES de crear dmg/zip, así ambos
+      # llevan el .app bueno y el latest-mac.yml queda con el hash correcto.
+      # --publish never: no subir todavía; el dmg aún hay que firmarlo.
+      - name: Package mac (firma app vía rcodesign afterPack)
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+          MAC_CERT_P12_B64: ${{ secrets.CSC_LINK }}
+          MAC_CERT_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          ASC_API_KEY_PATH: ${{ env.ASC_API_KEY_PATH }}
+        run: pnpm exec electron-builder --mac --publish never
+
+      # El .app ya va firmado/notarizado/stapled; el contenedor .dmg no. Se firma
+      # + notariza + staplea el dmg (1 sola llamada TSA, no las ~200 del .app).
+      - name: Sign & notarize DMG
+        env:
+          MAC_CERT_P12_B64: ${{ secrets.CSC_LINK }}
+          MAC_CERT_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+        run: |
+          TMP=$(mktemp -d)
+          printf '%s' "$MAC_CERT_P12_B64" | openssl base64 -d -A > "$TMP/cert.p12"
+          printf '%s' "$MAC_CERT_PASSWORD" > "$TMP/pass.txt"
+          # leaf-only: -clcerts descarta la intermedia G2 que rcodesign mal-elige.
+          # -legacy: el .p12 usa RC2-40-CBC que OpenSSL 3 rechaza sin él.
+          openssl pkcs12 -legacy -in "$TMP/cert.p12" -passin "file:$TMP/pass.txt" -nokeys -clcerts -out "$TMP/leaf.pem"
+          openssl pkcs12 -legacy -in "$TMP/cert.p12" -passin "file:$TMP/pass.txt" -nocerts -nodes -out "$TMP/key.pem"
+          cat "$TMP/leaf.pem" "$TMP/key.pem" > "$TMP/id.pem"
+          DMG=$(ls dist/*.dmg)
+          echo "🔏 firmando $DMG"
+          rcodesign sign --pem-file "$TMP/id.pem" "$DMG"
+          echo "☁️  notarizando + stapling $DMG"
+          rcodesign notary-submit --api-key-path "$ASC_API_KEY_PATH" --wait --staple "$DMG"
+          rm -rf "$TMP"
+
+      # Sanity antes de publicar: firma/notarización/staple validan en macOS real.
+      - name: Verify signature & notarization
+        run: |
+          APP="dist/mac-arm64/HugeDesk.app"; DMG=$(ls dist/*.dmg)
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          spctl -a -vvv -t exec "$APP"
+          xcrun stapler validate "$APP"
+          xcrun stapler validate "$DMG"
+
+      # Publish de la 2ª fase: sube dmg (firmado) + zip + latest-mac.yml (feed de
+      # auto-update) + blockmaps al mismo draft release que linux/win.
+      - name: Publish mac artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG=${{ needs.setup.outputs.tag }}
+          gh release view "$TAG" >/dev/null 2>&1 || \
+            gh release create "$TAG" --draft --title "$TAG" --notes "HugeDesk $TAG" || true
+          shopt -s nullglob
+          gh release upload "$TAG" --clobber \
+            dist/*.dmg dist/*.zip dist/latest-mac.yml dist/*.blockmap
