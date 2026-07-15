@@ -26,16 +26,19 @@ name: Build and Release Desktop
 # colgaba ~30min en el runner (firmaba cada binario anidado contra la TSA de
 # Apple en serie). rcodesign firma el .app entero en ~10s. Ver build/afterPack.cjs.
 
+# Disparo MANUAL a propósito: el repo privado no dispara nada, así no necesita
+# un PAT con escritura sobre este repo ni hay payloads externos que validar.
+#
+# La versión NO se pide: sale de package.json del repo privado (igual que hacía
+# electron-builder, que nombra el release con ella). `ref` solo existe para
+# construir una rama distinta de main; en un release normal no se toca.
 on:
-  # Lo dispara el repo privado al pushear un tag vX.Y.Z (.github/workflows/
-  # dispatch-release.yml allí). client_payload.tag = tag a construir.
-  repository_dispatch:
-    types: [build-release]
   workflow_dispatch:
     inputs:
-      tag:
-        description: 'Tag del repo privado a construir (p. ej. v0.1.5)'
-        required: true
+      ref:
+        description: 'Rama/tag/SHA del repo privado a construir'
+        required: false
+        default: main
         type: string
       platform:
         description: 'Qué construir'
@@ -53,29 +56,20 @@ permissions:
   contents: write # crear/actualizar el Release de este mismo repo
 
 jobs:
-  # Resuelve qué construir y de qué tag. linux/win van por matrix; macOS es un
-  # job aparte (deps nativas macOS + firma rcodesign), gateado por output `mac`.
+  # Resuelve qué construir. linux/win van por matrix; macOS es un job aparte
+  # (deps nativas macOS + firma rcodesign), gateado por output `mac`.
   setup:
     name: Resolve targets
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.pick.outputs.matrix }}
       mac: ${{ steps.pick.outputs.mac }}
-      tag: ${{ steps.pick.outputs.tag }}
     steps:
-      - name: Pick platforms and tag
+      - name: Pick platforms
         id: pick
         env:
-          PLATFORM: ${{ github.event.inputs.platform || github.event.client_payload.platform || 'all' }}
-          TAG: ${{ github.event.inputs.tag || github.event.client_payload.tag }}
+          PLATFORM: ${{ inputs.platform || 'all' }}
         run: |
-          if [ -z "$TAG" ]; then echo "❌ falta el tag a construir" && exit 1; fi
-          # El tag viaja por payload externo → validar antes de meterlo en un
-          # checkout. Solo vX.Y.Z(-sufijo). Sin esto, un payload hostil podría
-          # inyectar un ref arbitrario.
-          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
-            echo "❌ tag inválido: $TAG" && exit 1
-          fi
           LINUX='{"os":"ubuntu-latest","name":"linux","builder_flag":"--linux"}'
           FEDORA='{"os":"ubuntu-latest","name":"fedora","builder_flag":"--linux rpm"}'
           APPIMAGE='{"os":"ubuntu-latest","name":"appimage","builder_flag":"--linux AppImage"}'
@@ -95,8 +89,7 @@ jobs:
           esac
           echo "matrix={\"include\":[$ENTRIES]}" >> "$GITHUB_OUTPUT"
           echo "mac=$MAC" >> "$GITHUB_OUTPUT"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "→ construyendo: $PLATFORM @ $TAG (mac=$MAC)"
+          echo "→ construyendo: $PLATFORM @ ${{ inputs.ref }} (mac=$MAC)"
 
   # Linux (rpm/AppImage) + Windows (nsis). electron-builder publica directo.
   build:
@@ -112,7 +105,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: sebaszap123-dev/hugedesk
-          ref: ${{ needs.setup.outputs.tag }}
+          ref: ${{ inputs.ref }}
           token: ${{ secrets.SOURCE_REPO_TOKEN }}
           # No dejar el PAT en .git/config: los pasos de build no hacen git.
           persist-credentials: false
@@ -165,7 +158,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: sebaszap123-dev/hugedesk
-          ref: ${{ needs.setup.outputs.tag }}
+          ref: ${{ inputs.ref }}
           token: ${{ secrets.SOURCE_REPO_TOKEN }}
           persist-credentials: false
 
@@ -286,7 +279,10 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG=${{ needs.setup.outputs.tag }}
+          # Misma fuente de verdad que electron-builder usa para nombrar el
+          # release en los jobs linux/win: la versión de package.json.
+          VERSION=$(node -p "require('./package.json').version")
+          TAG="v$VERSION"
           gh release view "$TAG" >/dev/null 2>&1 || \
             gh release create "$TAG" --draft --title "$TAG" --notes "HugeDesk $TAG" || true
           shopt -s nullglob
