@@ -278,6 +278,10 @@ jobs:
       - name: Publish mac artifacts
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # OBLIGATORIO: sin esto gh infiere el repo del remote de git del cwd,
+          # que aquí es el checkout del repo PRIVADO → 404 (GITHUB_TOKEN no
+          # tiene acceso a él). El release va a este repo, no al del código.
+          GH_REPO: ${{ github.repository }}
         run: |
           # Misma fuente de verdad que electron-builder usa para nombrar el
           # release en los jobs linux/win: la versión de package.json.
