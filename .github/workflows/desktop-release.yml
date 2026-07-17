@@ -135,6 +135,8 @@ jobs:
         env:
           HUGEDESK_LICENSE_PUBKEY: ${{ secrets.HUGEDESK_LICENSE_PUBKEY }}
           HUGEDESK_ACTIVATION_URL: ${{ secrets.HUGEDESK_ACTIVATION_URL }}
+          HUGEDESK_REMOTE_URL: ${{ secrets.HUGEDESK_REMOTE_URL }}
+          HUGEDESK_REMOTE_ORIGIN: ${{ secrets.HUGEDESK_REMOTE_ORIGIN }}
         run: pnpm run build
 
       - name: Package and publish
@@ -227,6 +229,8 @@ jobs:
         env:
           HUGEDESK_LICENSE_PUBKEY: ${{ secrets.HUGEDESK_LICENSE_PUBKEY }}
           HUGEDESK_ACTIVATION_URL: ${{ secrets.HUGEDESK_ACTIVATION_URL }}
+          HUGEDESK_REMOTE_URL: ${{ secrets.HUGEDESK_REMOTE_URL }}
+          HUGEDESK_REMOTE_ORIGIN: ${{ secrets.HUGEDESK_REMOTE_ORIGIN }}
         run: pnpm run build
 
       # electron-builder arma .app + dmg + zip; NO firma (auto-discovery off,
