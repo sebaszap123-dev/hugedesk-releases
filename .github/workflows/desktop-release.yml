@@ -269,6 +269,13 @@ jobs:
           rm -rf "$TMP"
 
       # Sanity antes de publicar: firma/notarización/staple validan en macOS real.
+      #
+      # ⚠️  Además se verifica que main + CADA Helper app lleven el entitlement
+      # com.apple.security.cs.allow-jit: la notarización pasa igual SIN él, pero
+      # bajo hardened runtime el V8 del renderer no puede JIT → render-process-gone
+      # exitCode 5 en TODA Apple Silicon (así se publicó v0.1.6 rota; rcodesign
+      # NO propaga entitlements a los sub-bundles — ver build/afterPack.cjs del
+      # repo del código). codesign --verify / spctl / stapler NO detectan esto.
       - name: Verify signature & notarization
         run: |
           APP="dist/mac-arm64/HugeDesk.app"; DMG=$(ls dist/*.dmg)
@@ -276,6 +283,15 @@ jobs:
           spctl -a -vvv -t exec "$APP"
           xcrun stapler validate "$APP"
           xcrun stapler validate "$DMG"
+          echo "🎫 verificando entitlements allow-jit (main + helpers)"
+          for BIN in "$APP/Contents/MacOS/HugeDesk" \
+                     "$APP"/Contents/Frameworks/*.app/Contents/MacOS/*; do
+            if ! codesign -d --entitlements - "$BIN" 2>/dev/null | grep -q allow-jit; then
+              echo "❌ $(basename "$BIN") SIN com.apple.security.cs.allow-jit → crashearía con exitCode 5 en Apple Silicon"
+              exit 1
+            fi
+            echo "  ✓ allow-jit: $(basename "$BIN")"
+          done
 
       # Publish de la 2ª fase: sube dmg (firmado) + zip + latest-mac.yml (feed de
       # auto-update) + blockmaps al mismo draft release que linux/win.
