@@ -268,6 +268,42 @@ jobs:
           rcodesign notary-submit --api-key-path "$ASC_API_KEY_PATH" --wait --staple "$DMG"
           rm -rf "$TMP"
 
+      # Firmar + staplear cambió los bytes del DMG, pero electron-builder ya
+      # había escrito latest-mac.yml (y el .dmg.blockmap) con el hash/tamaño del
+      # DMG SIN firmar → el feed publicado declaraba un binario que no existe
+      # (v0.5.0: yml decía 180748944 bytes, el asset real pesa 180760629). El
+      # auto-update de mac no lo nota (usa el zip, cuyo .app ya iba firmado),
+      # pero cualquier verificación de integridad del DMG contra el yml falla.
+      # Se recalculan sha512/size del DMG en latest-mac.yml y se borra su
+      # blockmap: quedó calculado sobre el DMG sin firmar y nadie lo consume
+      # (el diferencial de electron-updater en mac usa el blockmap del zip).
+      # No se regenera con app-builder porque app-builder-bin no declara bin
+      # (electron-builder lo invoca por ruta interna) → `pnpm exec` no lo ve.
+      - name: Refresh DMG hash in latest-mac.yml
+        run: |
+          DMG=$(ls dist/*.dmg)
+          rm -f "$DMG.blockmap"
+          node - "$DMG" <<'EOF'
+          const { createHash } = require('node:crypto')
+          const fs = require('node:fs')
+          const { basename } = require('node:path')
+          const dmgPath = process.argv[2]
+          const buf = fs.readFileSync(dmgPath)
+          const sha512 = createHash('sha512').update(buf).digest('base64')
+          const size = buf.length
+          const yml = 'dist/latest-mac.yml'
+          const lines = fs.readFileSync(yml, 'utf8').split('\n')
+          let inDmg = false, patched = 0
+          for (let i = 0; i < lines.length; i++) {
+            if (/^\s*- url:/.test(lines[i])) inDmg = lines[i].trim() === `- url: ${basename(dmgPath)}`
+            else if (inDmg && /^\s+sha512:/.test(lines[i])) { lines[i] = lines[i].replace(/sha512:.*/, `sha512: ${sha512}`); patched++ }
+            else if (inDmg && /^\s+size:/.test(lines[i])) { lines[i] = lines[i].replace(/size:.*/, `size: ${size}`); patched++ }
+          }
+          if (patched !== 2) { console.error(`❌ no encontré la entrada del DMG en ${yml} (patched=${patched})`); process.exit(1) }
+          fs.writeFileSync(yml, lines.join('\n'))
+          console.log(`✓ latest-mac.yml → ${basename(dmgPath)} sha512/size actualizados (${size} bytes)`)
+          EOF
+
       # Sanity antes de publicar: firma/notarización/staple validan en macOS real.
       #
       # ⚠️  Además se verifica que main + CADA Helper app lleven el entitlement
@@ -292,6 +328,23 @@ jobs:
             fi
             echo "  ✓ allow-jit: $(basename "$BIN")"
           done
+          echo "🧾 verificando que latest-mac.yml declara los binarios reales (dmg + zip)"
+          node - <<'EOF'
+          const { createHash } = require('node:crypto')
+          const fs = require('node:fs')
+          const yml = fs.readFileSync('dist/latest-mac.yml', 'utf8')
+          const entries = [...yml.matchAll(/- url: (\S+)\n\s+sha512: (\S+)\n\s+size: (\d+)/g)]
+          if (!entries.length) { console.error('❌ latest-mac.yml sin entradas parseables'); process.exit(1) }
+          for (const [, url, sha512, size] of entries) {
+            const buf = fs.readFileSync(`dist/${url}`)
+            const real = createHash('sha512').update(buf).digest('base64')
+            if (real !== sha512 || buf.length !== Number(size)) {
+              console.error(`❌ ${url}: yml declara sha512=${sha512} size=${size}, real sha512=${real} size=${buf.length}`)
+              process.exit(1)
+            }
+            console.log(`  ✓ ${url}: sha512 y size coinciden`)
+          }
+          EOF
 
       # Publish de la 2ª fase: sube dmg (firmado) + zip + latest-mac.yml (feed de
       # auto-update) + blockmaps al mismo draft release que linux/win.
